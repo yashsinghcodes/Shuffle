@@ -20,12 +20,11 @@ jobs:
     - name: Install Docker on macos
       if: runner.os == 'macos'
       run: |
-          brew install --cask docker
-          open /Application/Docker.app
-          while ! docker system info > /dev/null 2>&1; do
-            echo "Waiting for Docker to launch..."
-            sleep 10
-          done
+        brew install docker docker-machine
+        docker-machine create --driver virtualbox default
+        docker-machine env default
+        eval "$(docker-machine env default)"
+        done
 
 
     - name: Build the stack
