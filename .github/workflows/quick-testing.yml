@@ -22,7 +22,6 @@ jobs:
       run: |
         brew install docker docker-machine
         brew services start docker-machine
-        done
 
 
     - name: Build the stack
