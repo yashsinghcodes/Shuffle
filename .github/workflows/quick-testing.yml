@@ -7,7 +7,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [macos-latest]
         architecture: [x64, arm64]
 
     steps:
@@ -16,6 +16,17 @@ jobs:
     
     - name: Set up opensearch directory
       run: mkdir shuffle-database && chmod -R 777 shuffle-database
+
+    - name: Install Docker on macos
+      if: runner.os == 'macos'
+      run: |
+          brew install --cask docker
+          open /Application/Docker.app
+          while ! docker system info > /dev/null 2>&1; do
+            echo "Waiting for Docker to launch..."
+            sleep 10
+          done
+
 
     - name: Build the stack
       run: docker compose up -d
