@@ -22,10 +22,8 @@ jobs:
       run: |
         brew install docker docker-machine docker-compose
         brew services start docker-machine
-        if ! pgrep Docker; then
-          launchctl start com.docker.service
-          sleep 20  # Wait for Docker to start
-        fi
+        launchctl start com.docker.service
+        sleep 20
 
     - name: Build the stack
       run: docker-compose up -d
