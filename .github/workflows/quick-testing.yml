@@ -20,7 +20,7 @@ jobs:
     - name: Install Docker on macos
       if: runner.os == 'macos'
       run: |
-        brew install docker docker-machine
+        brew install docker docker-machine docker-compose
         brew services start docker-machine
 
 
