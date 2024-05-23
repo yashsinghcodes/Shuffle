@@ -21,7 +21,7 @@ jobs:
       if: runner.os == 'macos'
       run: |
         brew install docker docker-machine
-        brew --cask install virtualbox
+        brew install virtualbox --cask
         docker-machine create --driver virtualbox default
         docker-machine env default
         eval "$(docker-machine env default)"
