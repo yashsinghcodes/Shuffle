@@ -102,6 +102,35 @@ export const CopyToClipboard = (props) => {
     )
 }
 
+export const Paragrah = (props) => {
+    const element = React.createElement(
+        `p`,
+        {},
+        props.children,
+    )
+
+    if (props.children[0] != undefined) {
+        if(typeof props.children[0] === "string") {
+            if (props.children[0].includes('.mp4')) {
+                return (
+                    <div>
+                        <video width="640" height="480" controls>
+                            <source src={`${props.children[0]}`} type="video/mp4" />
+                        </video>
+                    </div>
+                )
+            }
+        }
+    }
+
+
+    return (
+        <div class="sdf">
+            {element}
+        </div>
+    )
+}
+
 export const OuterLink = (props) => {
     if (props.href.includes("http") || props.href.includes("mailto")) {
         return (
@@ -941,6 +970,7 @@ const Docs = (defaultprops) => {
         h5: Heading,
         h6: Heading,
         a: OuterLink,
+        p: Paragrah,
     }
 
 
@@ -1188,7 +1218,7 @@ const Docs = (defaultprops) => {
 
     // Padding and zIndex etc set because of footer in cloud.
     const loadedCheck = (
-        <div style={{ minHeight: 1000, paddingTop: "60px", zIndex: 50000, maxWidth: 1920, minWidth: isMobile ? null : 1366, margin: "auto", }}>
+        <div style={{ minHeight: 1000, zIndex: 50000, maxWidth: 1920, minWidth: isMobile ? null : 1366, margin: "auto", }}>
             <BrowserView>{postDataBrowser}</BrowserView>
             <MobileView>{postDataMobile}</MobileView>
         </div>
