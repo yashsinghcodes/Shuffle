@@ -106,6 +106,7 @@ func createSchedule(ctx context.Context, scheduleId, workflowId, name, startNode
 	}
 
 	log.Printf("[INFO] Starting frequency for execution: %d", newfrequency)
+	
 
 	//jobret, err := newscheduler.Every(newfrequency).Seconds().NotImmediately().Run(job)
 	jobret, err := newscheduler.Every(newfrequency).Seconds().Run(job)
@@ -308,7 +309,7 @@ func handleGetWorkflowqueue(resp http.ResponseWriter, request *http.Request) {
 						if envData.Swarm {
 							env.Licensed = true
 							env.RunType = "docker"
-						}
+						} 
 
 						if envData.Kubernetes {
 							env.RunType = "k8s"
@@ -740,6 +741,7 @@ func handleWorkflowQueue(resp http.ResponseWriter, request *http.Request) {
 func runWorkflowExecutionTransaction(ctx context.Context, attempts int64, workflowExecutionId string, actionResult shuffle.ActionResult, resp http.ResponseWriter) {
 	log.Printf("[DEBUG][%s] Running workflow execution update", workflowExecutionId)
 
+
 	// Should start a tx for the execution here
 	workflowExecution, err := shuffle.GetWorkflowExecution(ctx, workflowExecutionId)
 	if err != nil {
@@ -923,7 +925,7 @@ func deleteWorkflow(resp http.ResponseWriter, request *http.Request) {
 	if len(workflow.ParentWorkflowId) > 0 {
 		resp.WriteHeader(403)
 		resp.Write([]byte(`{"success": false, "reason": "Can't delete a workflow distributed from your parent org"}`))
-		return
+		return 
 	}
 
 	if user.Id != workflow.Owner || len(user.Id) == 0 {
@@ -981,6 +983,8 @@ func deleteWorkflow(resp http.ResponseWriter, request *http.Request) {
 	resp.WriteHeader(200)
 	resp.Write([]byte(`{"success": true}`))
 }
+
+
 
 func handleExecution(id string, workflow shuffle.Workflow, request *http.Request, orgId string) (shuffle.WorkflowExecution, string, error) {
 	//go func() {
@@ -1075,6 +1079,7 @@ func handleExecution(id string, workflow shuffle.Workflow, request *http.Request
 			return shuffle.WorkflowExecution{}, fmt.Sprintf("Failed running: %s", err), err
 		}
 	}
+
 
 	err := imageCheckBuilder(execInfo.ImageNames)
 	if err != nil {
@@ -1349,7 +1354,7 @@ func handleExecution(id string, workflow shuffle.Workflow, request *http.Request
 		}
 	}
 
-	childNodes := shuffle.FindChildNodes(workflowExecution.Workflow, workflowExecution.Start, []string{}, []string{})
+	childNodes := shuffle.FindChildNodes(workflowExecution, workflowExecution.Start, []string{}, []string{})
 
 	startFound := false
 	newActions := []shuffle.Action{}
@@ -3405,7 +3410,7 @@ func executeSingleAction(resp http.ResponseWriter, request *http.Request) {
 	// FIXME: Should use environment that is in the source workflow if it exists
 	for i, _ := range workflowExecution.Workflow.Actions {
 		workflowExecution.Workflow.Actions[i].Environment = environment
-		workflowExecution.Workflow.Actions[i].Label = "TMP"
+		workflowExecution.Workflow.Actions[i].Label = "TMP" 
 	}
 	shuffle.SetWorkflowExecution(ctx, workflowExecution, false)
 
@@ -4187,6 +4192,7 @@ func checkUnfinishedExecution(resp http.ResponseWriter, request *http.Request) {
 	if err != nil {
 		log.Printf("[ERROR] Failed adding execution to db: %s", err)
 	}
+
 
 	resp.WriteHeader(200)
 	resp.Write([]byte(fmt.Sprintf(`{"success": true, "reason": "Reran workflow in %s"}`, parsedEnv)))
