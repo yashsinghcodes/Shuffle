@@ -99,6 +99,7 @@ jobs:
         echo "health_response<<EOF" >> $GITHUB_ENV
         echo "$HEALTH_RESPONSE" >> $GITHUB_ENV
         echo "EOF" >> $GITHUB_ENV
+        echo "$HEALTH_RESPONSE"
 
         WORKFLOWS_CREATE=$(echo "$HEALTH_RESPONSE" | jq -r '.workflows.create')
         WORKFLOWS_RUN=$(echo "$HEALTH_RESPONSE" | jq -r '.workflows.run')
