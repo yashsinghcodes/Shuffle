@@ -109,7 +109,7 @@ jobs:
         if [ "$WORKFLOWS_CREATE" = "true" ] && [ "$WORKFLOWS_RUN" = "true" ] && [ "$WORKFLOWS_RUN_FINISHED" = "true" ] && [ "$WORKFLOWS_RUN_STATUS" = "FINISHED" ] && [ "$WORKFLOWS_DELETE" = "true" ]; then
           echo "Health endpoint check was successful."
         else
-          echo "Health endpoint check failed. Response did not meet expected criteria."
+          echo "Health endpoint check failed. Response did not meet expected criteria. $HEALTH_RESPONSE"
           exit 1
         fi
   #  notify:
