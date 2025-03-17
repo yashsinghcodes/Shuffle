@@ -111,6 +111,8 @@ jobs:
           exit 1
         fi
 
+        sleep 10
+
         HEALTH_RESPONSE=$(curl -s 'http://localhost:3001/api/v1/health?force=true' \
           -H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7' \
           -H 'Accept-Language: en-US,en;q=0.9' \
@@ -125,8 +127,6 @@ jobs:
           -H 'sec-ch-ua: "Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"' \
           -H 'sec-ch-ua-mobile: ?0' \
           -H 'sec-ch-ua-platform: "macOS"')
-
-        echo "$HEALTH_RESPONSE"
 
         WORKFLOWS_CREATE=$(echo "$HEALTH_RESPONSE" | jq -r '.workflows.create')
         WORKFLOWS_RUN=$(echo "$HEALTH_RESPONSE" | jq -r '.workflows.run')
