@@ -126,6 +126,8 @@ jobs:
           -H 'sec-ch-ua-mobile: ?0' \
           -H 'sec-ch-ua-platform: "macOS"')
 
+        echo "$HEALTH_RESPONSE"
+
         WORKFLOWS_CREATE=$(echo "$HEALTH_RESPONSE" | jq -r '.workflows.create')
         WORKFLOWS_RUN=$(echo "$HEALTH_RESPONSE" | jq -r '.workflows.run')
         WORKFLOWS_RUN_FINISHED=$(echo "$HEALTH_RESPONSE" | jq -r '.workflows.run_finished')
