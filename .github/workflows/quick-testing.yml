@@ -112,7 +112,7 @@ jobs:
           exit 1
         fi
 
-        sleep 20
+        sleep 5
 
         HEALTH_RESPONSE=$(curl -s 'http://localhost:3001/api/v1/health?force=true' \
           -H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7' \
