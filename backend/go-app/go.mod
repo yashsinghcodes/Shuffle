@@ -4,7 +4,7 @@ go 1.24.0
 
 toolchain go1.24.3
 
-//replace github.com/shuffle/shuffle-shared => ../../../shuffle-shared
+replace github.com/shuffle/shuffle-shared => ../../../shuffle-shared
 
 //replace github.com/frikky/schemaless => ../../../schemaless
 
@@ -26,8 +26,8 @@ require (
 	github.com/gorilla/mux v1.8.1
 	github.com/h2non/filetype v1.1.3
 	github.com/satori/go.uuid v1.2.0
-	github.com/shuffle/shuffle-shared v1.0.0
-	github.com/shuffle/singul v0.0.26
+	github.com/shuffle/shuffle-shared v1.0.2
+	github.com/shuffle/singul v0.0.28
 	golang.org/x/crypto v0.45.0
 	google.golang.org/api v0.236.0
 	google.golang.org/grpc v1.72.2
@@ -56,6 +56,7 @@ require (
 	github.com/ProtonMail/go-crypto v1.1.6 // indirect
 	github.com/adrg/strutil v0.3.1 // indirect
 	github.com/algolia/algoliasearch-client-go/v3 v3.31.4 // indirect
+	github.com/andybalholm/brotli v1.2.0 // indirect
 	github.com/bitly/go-simplejson v0.5.1 // indirect
 	github.com/bradfitz/gomemcache v0.0.0-20250403215159-8d39553ac7cf // indirect
 	github.com/bradfitz/slice v0.0.0-20180809154707-2b758aa73013 // indirect
@@ -75,7 +76,7 @@ require (
 	github.com/envoyproxy/go-control-plane/envoy v1.32.4 // indirect
 	github.com/envoyproxy/protoc-gen-validate v1.2.1 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
-	github.com/frikky/schemaless v0.0.28 // indirect
+	github.com/frikky/schemaless v0.0.29 // indirect
 	github.com/fxamacker/cbor/v2 v2.9.0 // indirect
 	github.com/go-git/gcfg v1.5.1-0.20230307220236-3a3c6141e376 // indirect
 	github.com/go-jose/go-jose/v4 v4.1.3 // indirect

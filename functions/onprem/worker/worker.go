@@ -135,6 +135,182 @@ type UserInputSubflow struct {
 	CancelUrl   string `json:"cancel_url"`
 }
 
+type transactionJob struct {
+	ExecutionId string
+	Action      shuffle.ActionResult
+	StateKey    string
+	Retries     int
+}
+
+type streamTransactionState string
+
+const (
+	streamStateReceived  streamTransactionState = "received"
+	streamStateQueued    streamTransactionState = "queued"
+	streamStateRunning   streamTransactionState = "running"
+	streamStateSucceeded streamTransactionState = "succeeded"
+	streamStateFailed    streamTransactionState = "failed"
+)
+
+type transactionStateInfo struct {
+	ExecutionId string                 `json:"execution_id"`
+	ActionId    string                 `json:"action_id"`
+	State       streamTransactionState `json:"state"`
+	Retries     int                    `json:"retries"`
+	StatusCode  int                    `json:"status_code"`
+	LastError   string                 `json:"last_error,omitempty"`
+	UpdatedAt   int64                  `json:"updated_at"`
+}
+
+var (
+	transactionJobQueue chan transactionJob
+	transactionJobOnce  sync.Once
+
+	appRequestSemaphore chan struct{}
+	appRequestOnce      sync.Once
+
+	transactionStateMap sync.Map
+	workerClientCache   sync.Map
+)
+
+func getEnvIntOrDefault(key string, defaultValue int) int {
+	value := strings.TrimSpace(os.Getenv(key))
+	if len(value) == 0 {
+		return defaultValue
+	}
+
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		log.Printf("[WARNING] Invalid %s=%q. Using default %d", key, value, defaultValue)
+		return defaultValue
+	}
+
+	return parsed
+}
+
+func writeJSONResponse(resp http.ResponseWriter, statusCode int, body string) {
+	if resp == nil {
+		return
+	}
+
+	resp.WriteHeader(statusCode)
+	_, _ = resp.Write([]byte(body))
+}
+
+func initTransactionWorkers() {
+	queueSize := getEnvIntOrDefault("SHUFFLE_STREAM_TX_QUEUE_SIZE", 2048)
+	workerCount := getEnvIntOrDefault("SHUFFLE_STREAM_TX_WORKERS", 8)
+
+	transactionJobQueue = make(chan transactionJob, queueSize)
+	for i := 0; i < workerCount; i++ {
+		go func() {
+			for job := range transactionJobQueue {
+				processTransactionJob(job, false)
+			}
+		}()
+	}
+
+	log.Printf("[INFO] Initialized stream transaction workers. workers=%d queue_size=%d", workerCount, queueSize)
+}
+
+func enqueueTransactionJob(job transactionJob) error {
+	transactionJobOnce.Do(initTransactionWorkers)
+
+	select {
+	case transactionJobQueue <- job:
+		updateTransactionState(job.StateKey, job.ExecutionId, job.Action.Action.ID, streamStateQueued, job.Retries, http.StatusAccepted, "")
+		return nil
+	default:
+		return errors.New("stream transaction queue is full")
+	}
+}
+
+func getTransactionStateKey(actionResult shuffle.ActionResult) string {
+	actionID := actionResult.Action.ID
+	if len(actionID) == 0 {
+		actionID = "unknown_action"
+	}
+
+	completedAt := actionResult.CompletedAt
+	if completedAt == 0 {
+		completedAt = time.Now().UnixNano()
+	}
+
+	return fmt.Sprintf("%s:%s:%d", actionResult.ExecutionId, actionID, completedAt)
+}
+
+func updateTransactionState(stateKey, executionID, actionID string, state streamTransactionState, retries, statusCode int, lastError string) {
+	transactionStateMap.Store(stateKey, transactionStateInfo{
+		ExecutionId: executionID,
+		ActionId:    actionID,
+		State:       state,
+		Retries:     retries,
+		StatusCode:  statusCode,
+		LastError:   lastError,
+		UpdatedAt:   time.Now().Unix(),
+	})
+}
+
+func processTransactionJob(job transactionJob, syncFallback bool) (int, string) {
+	updateTransactionState(job.StateKey, job.ExecutionId, job.Action.Action.ID, streamStateRunning, job.Retries, 0, "")
+	statusCode, body := runWorkflowExecutionTransaction(context.Background(), 0, job.ExecutionId, job.Action)
+	if statusCode >= 400 {
+		updateTransactionState(job.StateKey, job.ExecutionId, job.Action.Action.ID, streamStateFailed, job.Retries, statusCode, body)
+		if !syncFallback {
+			log.Printf("[ERROR][%s] Async transaction failed. status=%d body=%s", job.ExecutionId, statusCode, body)
+		}
+
+		return statusCode, body
+	}
+
+	updateTransactionState(job.StateKey, job.ExecutionId, job.Action.Action.ID, streamStateSucceeded, job.Retries, statusCode, "")
+	return statusCode, body
+}
+
+func initAppRequestSemaphore() {
+	concurrency := getEnvIntOrDefault("SHUFFLE_APP_REQUEST_CONCURRENCY", 64)
+	appRequestSemaphore = make(chan struct{}, concurrency)
+	log.Printf("[INFO] Initialized app request semaphore. concurrency=%d", concurrency)
+}
+
+func runAsyncAppRequest(ctx context.Context, incomingUrl, appName string, port int, action *shuffle.Action, workflowExecution *shuffle.WorkflowExecution, image string) {
+	appRequestOnce.Do(initAppRequestSemaphore)
+
+	appRequestSemaphore <- struct{}{}
+	defer func() {
+		<-appRequestSemaphore
+	}()
+
+	if err := sendAppRequest(ctx, incomingUrl, appName, port, action, workflowExecution, image, 0); err != nil {
+		log.Printf("[ERROR] Failed sending request to app %s on port %d: %s", appName, port, err)
+	}
+}
+
+func getWorkerHTTPClient(baseUrl string) *http.Client {
+	clientKey := baseUrl
+	if parsed, err := url.Parse(baseUrl); err == nil && len(parsed.Scheme) > 0 && len(parsed.Host) > 0 {
+		clientKey = fmt.Sprintf("%s://%s", parsed.Scheme, parsed.Host)
+	}
+
+	if cached, ok := workerClientCache.Load(clientKey); ok {
+		return cached.(*http.Client)
+	}
+
+	client := shuffle.GetExternalClient(baseUrl)
+	if transport, ok := client.Transport.(*http.Transport); ok && transport != nil {
+		maxConnsPerHost := getEnvIntOrDefault("SHUFFLE_HTTP_MAX_CONNS_PER_HOST", 32)
+		maxIdleConnsPerHost := getEnvIntOrDefault("SHUFFLE_HTTP_MAX_IDLE_CONNS_PER_HOST", 16)
+		maxIdleConns := getEnvIntOrDefault("SHUFFLE_HTTP_MAX_IDLE_CONNS", 128)
+
+		transport.MaxConnsPerHost = maxConnsPerHost
+		transport.MaxIdleConnsPerHost = maxIdleConnsPerHost
+		transport.MaxIdleConns = maxIdleConns
+	}
+
+	actual, _ := workerClientCache.LoadOrStore(clientKey, client)
+	return actual.(*http.Client)
+}
+
 // Not using shuffle.SetWorkflowExecution as we only want to use cache in reality
 func setWorkflowExecution(ctx context.Context, workflowExecution shuffle.WorkflowExecution, dbSave bool) error {
 	if len(workflowExecution.ExecutionId) == 0 {
@@ -381,7 +557,7 @@ func shutdown(workflowExecution shuffle.WorkflowExecution, nodeId string, reason
 		req.Header.Add("Content-Type", "application/json")
 
 		//log.Printf("[DEBUG][%s] All App Logs: %#v", workflowExecution.ExecutionId, allLogs)
-		client := shuffle.GetExternalClient(abortUrl)
+		client := getWorkerHTTPClient(abortUrl)
 		newresp, err := client.Do(req)
 		if err != nil {
 			log.Printf("[WARNING][%s] Failed abort request: %s", workflowExecution.ExecutionId, err)
@@ -959,10 +1135,7 @@ func deployApp(cli *dockerclient.Client, image string, identifier string, env []
 			waitTime := time.Duration(action.ExecutionDelay) * time.Second
 
 			time.AfterFunc(waitTime, func() {
-				err = sendAppRequest(ctx, baseUrl, appName, exposedPort, &action, &workflowExecution, image, 0)
-				if err != nil {
-					log.Printf("[ERROR] Failed sending SCHEDULED request to app %s on port %d: %s", appName, exposedPort, err)
-				}
+				runAsyncAppRequest(ctx, baseUrl, appName, exposedPort, &action, &workflowExecution, image)
 			})
 
 		} else {
@@ -974,7 +1147,7 @@ func deployApp(cli *dockerclient.Client, image string, identifier string, env []
 				ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 				defer cancel() // Cancel the context to release resources even if not used
 
-				go sendAppRequest(ctx, baseUrl, appName, exposedPort, &action, &workflowExecution, image, 0)
+				go runAsyncAppRequest(ctx, baseUrl, appName, exposedPort, &action, &workflowExecution, image)
 			})
 		}
 
@@ -2256,7 +2429,7 @@ func handleSubflowPoller(ctx context.Context, workflowExecution shuffle.Workflow
 		bytes.NewBuffer([]byte(data)),
 	)
 
-	client := shuffle.GetExternalClient(streamResultUrl)
+	client := getWorkerHTTPClient(streamResultUrl)
 	newresp, err := client.Do(req)
 	if err != nil {
 		log.Printf("[ERROR] Failed making request (1): %s", err)
@@ -2696,7 +2869,7 @@ func getWorkerBackendExecution(auth string, executionId string) (*shuffle.Workfl
 	var workflowExecution *shuffle.WorkflowExecution
 
 	streamResultUrl := fmt.Sprintf("%s/api/v1/streams/results", backendUrl)
-	topClient := shuffle.GetExternalClient(backendUrl)
+	topClient := getWorkerHTTPClient(backendUrl)
 	requestData := shuffle.ActionResult{
 		Authorization: auth,
 		ExecutionId:   executionId,
@@ -2861,16 +3034,38 @@ func handleWorkflowQueue(resp http.ResponseWriter, request *http.Request) {
 		return
 	}
 
+	// App sending resule -> worker -> timeout. 
+
 	log.Printf("[DEBUG][%s] Action: Received, Label: '%s', Action: '%s', Status: %s, Run status: %s, Extra=Retry:%d", workflowExecution.ExecutionId, actionResult.Action.Label, actionResult.Action.AppName, actionResult.Status, workflowExecution.Status, retries)
+	stateKey := getTransactionStateKey(actionResult)
+	updateTransactionState(stateKey, workflowExecution.ExecutionId, actionResult.Action.ID, streamStateReceived, retries, 0, "")
 
 	// results = append(results, actionResult)
 	// log.Printf("[INFO][%s] Time to execute %s (%s) with app %s:%s, function %s, env %s with %d parameters.", workflowExecution.ExecutionId, action.ID, action.Label, action.AppName, action.AppVersion, action.Name, action.Environment, len(action.Parameters))
-	// log.Printf("[DEBUG][%s] In workflowQueue with transaction", workflowExecution.ExecutionId)
-	runWorkflowExecutionTransaction(ctx, 0, workflowExecution.ExecutionId, actionResult, resp)
+	log.Printf("[DEBUG][%s] In workflowQueue with transaction", workflowExecution.ExecutionId)
+	err = enqueueTransactionJob(transactionJob{
+		ExecutionId: workflowExecution.ExecutionId,
+		Action:      actionResult,
+		StateKey:    stateKey,
+		Retries:     retries,
+	})
+	if err != nil {
+		log.Printf("[WARNING][%s] Transaction queue full. Rejecting stream result without sync fallback: %s", workflowExecution.ExecutionId, err)
+		statusCode, err := processTransactionJob(transactionJob{
+			ExecutionId: workflowExecution.ExecutionId,
+			Action:      actionResult,
+			StateKey:    stateKey,
+			Retries:     retries,
+		}, true)
+		writeJSONResponse(resp, statusCode, err)
+		return
+	}
+
+	writeJSONResponse(resp, http.StatusOK, `{"success": true}`)
 }
 
 // Will make sure transactions are always ran for an execution. This is recursive if it fails. Allowed to fail up to 5 times
-func runWorkflowExecutionTransaction(ctx context.Context, attempts int64, workflowExecutionId string, actionResult shuffle.ActionResult, resp http.ResponseWriter) {
+func runWorkflowExecutionTransaction(ctx context.Context, attempts int64, workflowExecutionId string, actionResult shuffle.ActionResult) (int, string) {
 	//log.Printf("[DEBUG][%s] IN WORKFLOWEXECUTION SUB!", actionResult.ExecutionId)
 	workflowExecution, err := shuffle.GetWorkflowExecution(ctx, workflowExecutionId)
 	if err != nil {
@@ -2878,9 +3073,7 @@ func runWorkflowExecutionTransaction(ctx context.Context, attempts int64, workfl
 		workflowExecution, err = getWorkerBackendExecution(actionResult.Authorization, actionResult.ExecutionId)
 		if err != nil {
 			log.Printf("[ERROR] Failed getting execution cache: %s", err)
-			resp.WriteHeader(400)
-			resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "Failed getting execution"}`)))
-			return
+			return http.StatusBadRequest, `{"success": false, "reason": "Failed getting execution"}`
 		}
 	}
 
@@ -2891,10 +3084,7 @@ func runWorkflowExecutionTransaction(ctx context.Context, attempts int64, workfl
 	if err == nil {
 		if workflowExecution.Status != "EXECUTING" && workflowExecution.Status != "WAITING" {
 			log.Printf("[WARNING][%s] Execution is not executing, but %s. Stopping Transaction update.", workflowExecution.ExecutionId, workflowExecution.Status)
-			if resp != nil {
-				resp.WriteHeader(200)
-				resp.Write([]byte(fmt.Sprintf(`{"success": true, "reason": "Execution is not executing, but %s"}`, workflowExecution.Status)))
-			}
+			responseBody := fmt.Sprintf(`{"success": true, "reason": "Execution is not executing, but %s"}`, workflowExecution.Status)
 
 			log.Printf("[DEBUG][%s] Shutting down (35)", workflowExecution.ExecutionId)
 
@@ -2906,7 +3096,7 @@ func runWorkflowExecutionTransaction(ctx context.Context, attempts int64, workfl
 
 			sendResult(*workflowExecution, shutdownData)
 			shutdown(*workflowExecution, "", "", false)
-			return
+			return http.StatusOK, responseBody
 		}
 
 		/*** STARTREMOVE ***/
@@ -2925,7 +3115,7 @@ func runWorkflowExecutionTransaction(ctx context.Context, attempts int64, workfl
 	} else {
 		if strings.Contains(strings.ToLower(fmt.Sprintf("%s", err)), "already been ran") || strings.Contains(strings.ToLower(fmt.Sprintf("%s", err)), "already finished") {
 			log.Printf("[ERROR][%s] Skipping rerun of action result as it's already been ran: %s", workflowExecution.ExecutionId)
-			return
+			return http.StatusOK, `{"success": true, "reason": "Action already handled"}`
 		}
 
 		log.Printf("[DEBUG] Rerunning transaction? %s", err)
@@ -2936,9 +3126,7 @@ func runWorkflowExecutionTransaction(ctx context.Context, attempts int64, workfl
 				workflowExecution, err = getWorkerBackendExecution(actionResult.Authorization, actionResult.ExecutionId)
 				if err != nil {
 					log.Printf("[ERROR][%s] Failed getting execution cache (2): %s", workflowExecution.ExecutionId, err)
-					resp.WriteHeader(400)
-					resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "Failed getting execution (2)"}`)))
-					return
+					return http.StatusBadRequest, `{"success": false, "reason": "Failed getting execution (2)"}`
 				}
 			}
 
@@ -2948,17 +3136,13 @@ func runWorkflowExecutionTransaction(ctx context.Context, attempts int64, workfl
 			workflowExecution, dbSave, err = shuffle.ParsedExecutionResult(ctx, *workflowExecution, actionResult, false, 0)
 			if err != nil {
 				log.Printf("[ERROR][%s] Failed execution of parsedexecution (2): %s", workflowExecution.ExecutionId, err)
-				resp.WriteHeader(401)
-				resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "Failed getting execution (2)"}`)))
-				return
+				return http.StatusUnauthorized, `{"success": false, "reason": "Failed getting execution (2)"}`
 			} else {
 				log.Printf("[DEBUG][%s] Successfully got ParsedExecution with %d results!", workflowExecution.ExecutionId, len(workflowExecution.Results))
 			}
 		} else {
 			log.Printf("[ERROR][%s] Failed execution of parsedexecution: %s", workflowExecution.ExecutionId, err)
-			resp.WriteHeader(401)
-			resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "Failed getting execution"}`)))
-			return
+			return http.StatusUnauthorized, `{"success": false, "reason": "Failed getting execution"}`
 		}
 	}
 
@@ -2993,7 +3177,7 @@ func runWorkflowExecutionTransaction(ctx context.Context, attempts int64, workfl
 			/*
 				if len(workflowExecution.Results) <= len(workflowExecution.Workflow.Actions) {
 					log.Printf("[DEBUG][%s] Rerunning transaction as results has changed. %d vs %d", workflowExecution.ExecutionId, len(workflowExecution.Results), len(workflowExecution.Workflow.Actions))
-					runWorkflowExecutionTransaction(ctx, attempts, workflowExecutionId, actionResult, resp)
+					runWorkflowExecutionTransaction(ctx, attempts, workflowExecutionId, actionResult)
 					return
 				}
 			*/
@@ -3009,10 +3193,7 @@ func runWorkflowExecutionTransaction(ctx context.Context, attempts int64, workfl
 		err = setWorkflowExecution(ctx, *workflowExecution, dbSave)
 		if err != nil {
 			log.Printf("[ERROR][%s] Failed setting execution: %s", workflowExecution.ExecutionId, err)
-
-			resp.WriteHeader(400)
-			resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "Failed setting workflowexecution actionresult: %s"}`, err)))
-			return
+			return http.StatusBadRequest, fmt.Sprintf(`{"success": false, "reason": "Failed setting workflowexecution actionresult: %s"}`, err)
 		}
 
 		/*** STARTREMOVE ***/
@@ -3047,8 +3228,7 @@ func runWorkflowExecutionTransaction(ctx context.Context, attempts int64, workfl
 	//	//handleExecutionResult(*workflowExecution)
 	//}
 
-	resp.WriteHeader(200)
-	resp.Write([]byte(fmt.Sprintf(`{"success": true}`)))
+	return http.StatusOK, `{"success": true}`
 }
 
 func sendSelfRequest(actionResult shuffle.ActionResult) {
@@ -3090,7 +3270,7 @@ func sendSelfRequest(actionResult shuffle.ActionResult) {
 		return
 	}
 
-	client := shuffle.GetExternalClient(streamUrl)
+	client := getWorkerHTTPClient(streamUrl)
 	newresp, err := client.Do(req)
 	if err != nil {
 		log.Printf("[ERROR][%s] Error running finishing request (2): %s", actionResult.ExecutionId, err)
@@ -3148,7 +3328,7 @@ func sendResult(workflowExecution shuffle.WorkflowExecution, data []byte) {
 		return
 	}
 
-	client := shuffle.GetExternalClient(streamUrl)
+	client := getWorkerHTTPClient(streamUrl)
 	newresp, err := client.Do(req)
 	if err != nil {
 		log.Printf("[ERROR][%s] Error running finishing request (1): %s", workflowExecution.ExecutionId, err)
@@ -4223,7 +4403,7 @@ func sendAppRequest(ctx context.Context, incomingUrl, appName string, port int, 
 		//log.Printf("[DEBUG][%s] Adding %s to cache (%#v)", workflowExecution.ExecutionId, newExecId, action.Name)
 	}
 
-	client := shuffle.GetExternalClient(streamUrl)
+	client := getWorkerHTTPClient(streamUrl)
 	customTimeout := os.Getenv("SHUFFLE_APP_REQUEST_TIMEOUT")
 	if len(customTimeout) > 0 {
 		// convert to int
@@ -4605,7 +4785,7 @@ func checkStandaloneRun() {
 	// 1. Reset the execution after getting it
 	data = fmt.Sprintf(`{"execution_id": "%s", "authorization": "%s"}`, executionId, authorization)
 	streamResultUrl := fmt.Sprintf("%s/api/v1/streams/results", backendUrl)
-	client := shuffle.GetExternalClient(streamResultUrl)
+	client := getWorkerHTTPClient(streamResultUrl)
 	req, err := http.NewRequest(
 		"POST",
 		streamResultUrl,
@@ -4753,7 +4933,7 @@ func main() {
 
 	//log.Printf("[INFO] Setting up worker environment")
 	sleepTime = 5
-	client := shuffle.GetExternalClient(baseUrl)
+	client := getWorkerHTTPClient(baseUrl)
 
 	if timezone == "" {
 		timezone = "Europe/Amsterdam"
@@ -4953,7 +5133,7 @@ func handleRunExecution(resp http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	client := shuffle.GetExternalClient(streamResultUrl)
+	client := getWorkerHTTPClient(streamResultUrl)
 	newresp, err := client.Do(req)
 	if err != nil {
 		log.Printf("[ERROR] Failed making request (2): %s", err)
@@ -5130,6 +5310,9 @@ func handleDownloadImage(resp http.ResponseWriter, request *http.Request) {
 }
 
 func runWebserver(listener net.Listener) {
+	transactionJobOnce.Do(initTransactionWorkers)
+	appRequestOnce.Do(initAppRequestSemaphore)
+
 	r := mux.NewRouter()
 	r.HandleFunc("/api/v1/streams", handleWorkflowQueue).Methods("POST", "OPTIONS")
 	r.HandleFunc("/api/v1/streams/results", handleGetStreamResults).Methods("POST", "OPTIONS")
