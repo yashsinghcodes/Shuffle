@@ -142,6 +142,10 @@ type transactionJob struct {
 	Retries     int
 }
 
+type executionJob struct {
+	Request shuffle.OrborusExecutionRequest
+}
+
 type streamTransactionState string
 
 const (
@@ -171,6 +175,9 @@ var (
 
 	transactionStateMap sync.Map
 	workerClientCache   sync.Map
+
+	executionJobQueue chan executionJob
+	executionJobOnce  sync.Once
 )
 
 func getEnvIntOrDefault(key string, defaultValue int) int {
@@ -271,6 +278,33 @@ func initAppRequestSemaphore() {
 	concurrency := getEnvIntOrDefault("SHUFFLE_APP_REQUEST_CONCURRENCY", 64)
 	appRequestSemaphore = make(chan struct{}, concurrency)
 	log.Printf("[INFO] Initialized app request semaphore. concurrency=%d", concurrency)
+}
+
+func initExecutionWorkers() {
+	queueSize := getEnvIntOrDefault("SHUFFLE_EXECUTION_QUEUE_SIZE", 512)
+	workerCount := getEnvIntOrDefault("SHUFFLE_EXECUTION_WORKERS", 1)
+
+	executionJobQueue = make(chan executionJob, queueSize)
+	for i := 0; i < workerCount; i++ {
+		go func(workerID int) {
+			for job := range executionJobQueue {
+				processExecutionJob(workerID, job)
+			}
+		}(i)
+	}
+
+	log.Printf("[INFO] Initialized execution workers. workers=%d queue_size=%d", workerCount, queueSize)
+}
+
+func enqueueExecutionJob(job executionJob) error {
+	executionJobOnce.Do(initExecutionWorkers)
+
+	select {
+	case executionJobQueue <- job:
+		return nil
+	default:
+		return errors.New("execution queue is full")
+	}
 }
 
 func runAsyncAppRequest(ctx context.Context, incomingUrl, appName string, port int, action *shuffle.Action, workflowExecution *shuffle.WorkflowExecution, image string) {
@@ -1508,6 +1542,66 @@ func countHealthyServiceTasks(dockercli *dockerclient.Client, serviceID string) 
 	}
 
 	return count, nil
+}
+
+func getEffectiveSwarmNetworkName() string {
+	if swarmNetworkName == "" {
+		swarmNetworkName = "shuffle_swarm_executions"
+	}
+
+	return swarmNetworkName
+}
+
+func hasTaskNetworkAttachment(service swarm.Service, networkTarget string) bool {
+	if len(networkTarget) == 0 {
+		return false
+	}
+
+	for _, attached := range service.Spec.TaskTemplate.Networks {
+		if attached.Target == networkTarget {
+			return true
+		}
+	}
+
+	return false
+}
+
+func appendUniqueNetworkAttachment(existing []swarm.NetworkAttachmentConfig, target string) []swarm.NetworkAttachmentConfig {
+	if len(target) == 0 {
+		return existing
+	}
+
+	for _, attached := range existing {
+		if attached.Target == target {
+			return existing
+		}
+	}
+
+	return append(existing, swarm.NetworkAttachmentConfig{Target: target})
+}
+
+func ensureServiceTaskNetworkAttachment(ctx context.Context, dockercli *dockerclient.Client, service swarm.Service, networkName, networkID string) (bool, error) {
+	hasByName := hasTaskNetworkAttachment(service, networkName)
+	hasByID := hasTaskNetworkAttachment(service, networkID)
+	if hasByName || hasByID {
+		return false, nil
+	}
+
+	target := networkID
+	if len(target) == 0 {
+		target = networkName
+	}
+
+	updatedSpec := service.Spec
+	updatedSpec.TaskTemplate.Networks = appendUniqueNetworkAttachment(updatedSpec.TaskTemplate.Networks, target)
+
+	_, err := dockercli.ServiceUpdate(ctx, service.ID, service.Version, updatedSpec, types.ServiceUpdateOptions{})
+	if err != nil {
+		return false, err
+	}
+
+	log.Printf("[INFO] Reconciled missing task network attachment for service %s. Added %s", service.Spec.Annotations.Name, target)
+	return true, nil
 }
 
 func getWorkerURLs() ([]string, error) {
@@ -3034,7 +3128,7 @@ func handleWorkflowQueue(resp http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	// App sending resule -> worker -> timeout. 
+	// App sending resule -> worker -> timeout.
 
 	log.Printf("[DEBUG][%s] Action: Received, Label: '%s', Action: '%s', Status: %s, Run status: %s, Extra=Retry:%d", workflowExecution.ExecutionId, actionResult.Action.Label, actionResult.Action.AppName, actionResult.Status, workflowExecution.Status, retries)
 	stateKey := getTransactionStateKey(actionResult)
@@ -3767,6 +3861,9 @@ func deploySwarmService(dockercli *dockerclient.Client, name, image string, depl
 			},
 		},
 		TaskTemplate: swarm.TaskSpec{
+			Networks: []swarm.NetworkAttachmentConfig{
+				swarm.NetworkAttachmentConfig{Target: networkName},
+			},
 			Resources: &swarm.ResourceRequirements{
 				Reservations: &swarm.Resources{},
 			},
@@ -3799,9 +3896,8 @@ func deploySwarmService(dockercli *dockerclient.Client, name, image string, depl
 	}
 
 	if len(os.Getenv("SHUFFLE_SWARM_OTHER_NETWORK")) > 0 {
-		serviceSpec.Networks = append(serviceSpec.Networks, swarm.NetworkAttachmentConfig{
-			Target: "shuffle_shuffle",
-		})
+		serviceSpec.Networks = appendUniqueNetworkAttachment(serviceSpec.Networks, "shuffle_shuffle")
+		serviceSpec.TaskTemplate.Networks = appendUniqueNetworkAttachment(serviceSpec.TaskTemplate.Networks, "shuffle_shuffle")
 	}
 
 	if strings.ToLower(os.Getenv("SHUFFLE_PASS_APP_PROXY")) == "true" {
@@ -3923,9 +4019,7 @@ func deploySwarmService(dockercli *dockerclient.Client, name, image string, depl
 					log.Printf("[DEBUG] Found service %s (%s) — patching network attach", service.ID, svc.ID)
 
 					spec := svc.Spec
-					spec.TaskTemplate.Networks = append(spec.TaskTemplate.Networks, swarm.NetworkAttachmentConfig{
-						Target: networkID,
-					})
+					spec.TaskTemplate.Networks = appendUniqueNetworkAttachment(spec.TaskTemplate.Networks, networkID)
 
 					_, uerr := dockercli.ServiceUpdate(ctx, svc.ID, svc.Version, spec, types.ServiceUpdateOptions{})
 					if uerr != nil {
@@ -4012,6 +4106,13 @@ func findAppInfo(image, name string, redeploy bool) (int, error) {
 			}
 		}
 
+		swarmExecNetworkName := getEffectiveSwarmNetworkName()
+		swarmExecNetworkID, networkErr := getNetworkId(context.Background(), dockercli)
+		if networkErr != nil || len(swarmExecNetworkID) == 0 {
+			log.Printf("[WARNING] Failed finding swarm execution network %s while reconciling service network: %v", swarmExecNetworkName, networkErr)
+			swarmExecNetworkID = swarmExecNetworkName
+		}
+
 		for _, service := range services {
 			//log.Printf("[INFO] Service: %#v. Ports: %#v", service.Spec.Annotations.Name, service.Spec.EndpointSpec)
 
@@ -4034,6 +4135,14 @@ func findAppInfo(image, name string, redeploy bool) (int, error) {
 
 			if service.Spec.Annotations.Name != name && service.Spec.Annotations.Name != strings.Replace(name, ".", "-", -1) {
 				continue
+			}
+
+			updated, updateErr := ensureServiceTaskNetworkAttachment(context.Background(), dockercli, service, swarmExecNetworkName, swarmExecNetworkID)
+			if updateErr != nil {
+				log.Printf("[WARNING] Failed reconciling task network attachment for service %s: %s", service.Spec.Annotations.Name, updateErr)
+			} else if updated {
+				// Give swarm a short moment to refresh DNS and task endpoints
+				time.Sleep(2 * time.Second)
 			}
 
 			if redeploy {
@@ -5022,7 +5131,7 @@ func main() {
 	}
 }
 
-func checkUnfinished(resp http.ResponseWriter, request *http.Request, execRequest shuffle.OrborusExecutionRequest) {
+func checkUnfinished(execRequest shuffle.OrborusExecutionRequest) {
 	// Meant as a function that periodically checks whether previous executions have finished or not.
 	// Should probably be based on executedIds and finishedIds
 	// Schedule a check in the future instead?
@@ -5051,48 +5160,35 @@ func checkUnfinished(resp http.ResponseWriter, request *http.Request, execReques
 	sendResult(*exec, data)
 }
 
-func handleRunExecution(resp http.ResponseWriter, request *http.Request) {
-	defer request.Body.Close()
-	body, err := ioutil.ReadAll(request.Body)
-	if err != nil {
-		log.Printf("[WARNING] Failed reading body for stream result queue")
-		resp.WriteHeader(400)
-		resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "%s"}`, err)))
+func processExecutionJob(workerID int, job executionJob) {
+	execRequest := job.Request
+	start := time.Now()
+	if err := processRunExecution(execRequest); err != nil {
+		log.Printf("[ERROR][%s] Execute worker %d failed after %s: %s", execRequest.ExecutionId, workerID, time.Since(start), err)
 		return
 	}
 
-	//log.Printf("[DEBUG] In run execution with body length %d", len(body))
-	var execRequest shuffle.OrborusExecutionRequest
-	err = json.Unmarshal(body, &execRequest)
-	if err != nil {
-		log.Printf("[WARNING] Failed shuffle.WorkflowExecution unmarshaling: %s", err)
-		resp.WriteHeader(400)
-		resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "%s"}`, err)))
-		return
+	if debug {
+		log.Printf("[DEBUG][%s] Execute worker %d finished in %s", execRequest.ExecutionId, workerID, time.Since(start))
 	}
+}
 
-	// Checks if a workflow is done 30 seconds later, and sends info to backend no matter what
+func processRunExecution(execRequest shuffle.OrborusExecutionRequest) error {
 	go func() {
-		time.Sleep(time.Duration(30) * time.Second)
-		checkUnfinished(resp, request, execRequest)
+		time.Sleep(30 * time.Second)
+		checkUnfinished(execRequest)
 	}()
 	window.AddEvent(time.Now())
 
 	ctx := context.Background()
 
-	// FIXME: This should be PER EXECUTION
-	//if strings.ToLower(os.Getenv("SHUFFLE_PASS_APP_PROXY")) == "true" {
-	// Is it ok if these are standard? Should they be update-able after launch? Hmm
 	if len(execRequest.HTTPProxy) > 0 {
-		log.Printf("[DEBUG] Sending proxy info to child process")
 		os.Setenv("SHUFFLE_PASS_APP_PROXY", execRequest.ShufflePassProxyToApp)
 	}
 	if len(execRequest.HTTPProxy) > 0 {
-		log.Printf("[DEBUG] Running with default HTTP proxy %s", execRequest.HTTPProxy)
 		os.Setenv("HTTP_PROXY", execRequest.HTTPProxy)
 	}
 	if len(execRequest.HTTPSProxy) > 0 {
-		log.Printf("[DEBUG] Running with default HTTPS proxy %s", execRequest.HTTPSProxy)
 		os.Setenv("HTTPS_PROXY", execRequest.HTTPSProxy)
 	}
 	if len(execRequest.EnvironmentName) > 0 {
@@ -5112,86 +5208,53 @@ func handleRunExecution(resp http.ResponseWriter, request *http.Request) {
 		baseUrl = execRequest.BaseUrl
 	}
 
-	// Setting to just have an auth available.
 	if len(execRequest.Authorization) > 0 && len(os.Getenv("AUTHORIZATION")) == 0 {
-		//log.Printf("[DEBUG] Sending proxy info to child process")
 		os.Setenv("AUTHORIZATION", execRequest.Authorization)
 	}
 
-	var workflowExecution shuffle.WorkflowExecution
 	streamResultUrl := fmt.Sprintf("%s/api/v1/streams/results", baseUrl)
 	req, err := http.NewRequest(
 		"POST",
 		streamResultUrl,
 		bytes.NewBuffer([]byte(fmt.Sprintf(`{"execution_id": "%s", "authorization": "%s"}`, execRequest.ExecutionId, execRequest.Authorization))),
 	)
-
 	if err != nil {
-		log.Printf("[ERROR][%s] Failed to create a new request", execRequest.ExecutionId)
-		resp.WriteHeader(500)
-		resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "%s"}`, err)))
-		return
+		return err
 	}
 
 	client := getWorkerHTTPClient(streamResultUrl)
 	newresp, err := client.Do(req)
 	if err != nil {
-		log.Printf("[ERROR] Failed making request (2): %s", err)
-		resp.WriteHeader(500)
-		resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "%s"}`, err)))
-		return
+		return err
 	}
-
 	defer newresp.Body.Close()
-	body, err = ioutil.ReadAll(newresp.Body)
+
+	body, err := ioutil.ReadAll(newresp.Body)
 	if err != nil {
-		log.Printf("[ERROR][%s] Failed reading body (2): %s", execRequest.ExecutionId, err)
-		resp.WriteHeader(500)
-		resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "%s"}`, err)))
-		return
+		return err
 	}
 
 	if newresp.StatusCode != 200 {
-		log.Printf("[ERROR][%s] Bad statuscode: %d, %s", execRequest.ExecutionId, newresp.StatusCode, string(body))
-
-		if strings.Contains(string(body), "Workflowexecution is already finished") {
-			log.Printf("[DEBUG] Shutting down (19)")
-			//shutdown(workflowExecution, "", "", true)
-		}
-
-		resp.WriteHeader(500)
-		resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "Bad statuscode: %d"}`, newresp.StatusCode)))
-		return
+		return errors.New(fmt.Sprintf("bad statuscode: %d, %s", newresp.StatusCode, string(body)))
 	}
 
+	var workflowExecution shuffle.WorkflowExecution
 	err = json.Unmarshal(body, &workflowExecution)
 	if err != nil {
-		log.Printf("[ERROR] Failed workflowExecution unmarshal: %s", err)
-		resp.WriteHeader(500)
-		resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "%s"}`, err)))
-		return
+		return err
 	}
 
-	//err = shuffle.SetWorkflowExecution(ctx, workflowExecution, true)
 	err = setWorkflowExecution(ctx, workflowExecution, true)
 	if err != nil {
 		log.Printf("[ERROR] Failed initializing execution saving for %s: %s", workflowExecution.ExecutionId, err)
 	}
 
 	if workflowExecution.Status == "FINISHED" || workflowExecution.Status == "SUCCESS" {
-		log.Printf("[DEBUG] Workflow %s is finished. Exiting worker.", workflowExecution.ExecutionId)
-		log.Printf("[DEBUG] Shutting down (20)")
-
-		resp.WriteHeader(200)
-		resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "Bad status for execution - already %s. Returning with 200 OK"}`, workflowExecution.Status)))
-		return
+		return nil
 	}
-
-	//startAction, extra, children, parents, visited, executed, nextActions, environments := shuffle.GetExecutionVariables(ctx, workflowExecution.ExecutionId)
 
 	extra := 0
 	for _, trigger := range workflowExecution.Workflow.Triggers {
-		//log.Printf("Appname trigger (0): %s", trigger.AppName)
 		if trigger.AppName == "User Input" || trigger.AppName == "Shuffle Workflow" {
 			extra += 1
 		}
@@ -5200,20 +5263,12 @@ func handleRunExecution(resp http.ResponseWriter, request *http.Request) {
 	log.Printf("[INFO][%s] (1) Status: %s, Results: %d, actions: %d", workflowExecution.ExecutionId, workflowExecution.Status, len(workflowExecution.Results), len(workflowExecution.Workflow.Actions)+extra)
 
 	if workflowExecution.Status != "EXECUTING" {
-		log.Printf("[WARNING] Exiting as worker execution has status %s!", workflowExecution.Status)
-		log.Printf("[DEBUG] Shutting down (38)")
-		resp.WriteHeader(400)
-		resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "Bad status %s for the workflow execution %s"}`, workflowExecution.Status, workflowExecution.ExecutionId)))
-		return
+		return errors.New(fmt.Sprintf("bad status %s for workflow execution %s", workflowExecution.Status, workflowExecution.ExecutionId))
 	}
-
-	//log.Printf("[DEBUG] Starting execution :O")
 
 	cacheKey := fmt.Sprintf("workflowexecution_%s", workflowExecution.ExecutionId)
 	execData, err := json.Marshal(workflowExecution)
-	if err != nil {
-		log.Printf("[ERROR][%s] Failed marshalling execution during set (3): %s", workflowExecution.ExecutionId, err)
-	} else {
+	if err == nil {
 		err = shuffle.SetCache(ctx, cacheKey, execData, 31)
 		if err != nil {
 			log.Printf("[ERROR][%s] Failed adding to cache during setexecution (3): %s", workflowExecution.ExecutionId, err)
@@ -5222,16 +5277,42 @@ func handleRunExecution(resp http.ResponseWriter, request *http.Request) {
 
 	err = executionInit(workflowExecution)
 	if err != nil {
-		log.Printf("[DEBUG][%s] Shutting down (30) - Workflow setup failed: %s", workflowExecution.ExecutionId, err)
-		resp.WriteHeader(500)
-		resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "Error in execution init: %s"}`, err)))
-		return
-		//shutdown(workflowExecution, "", "", true)
+		return errors.New(fmt.Sprintf("error in execution init: %s", err))
 	}
 
 	handleExecutionResult(workflowExecution)
-	resp.WriteHeader(200)
-	resp.Write([]byte(fmt.Sprintf(`{"success": true}`)))
+	return nil
+}
+
+func handleRunExecution(resp http.ResponseWriter, request *http.Request) {
+	defer request.Body.Close()
+	body, err := ioutil.ReadAll(request.Body)
+	if err != nil {
+		log.Printf("[WARNING] Failed reading body for stream result queue")
+		writeJSONResponse(resp, http.StatusBadRequest, fmt.Sprintf(`{"success": false, "reason": "%s"}`, err))
+		return
+	}
+
+	var execRequest shuffle.OrborusExecutionRequest
+	err = json.Unmarshal(body, &execRequest)
+	if err != nil {
+		log.Printf("[WARNING] Failed shuffle.WorkflowExecution unmarshaling: %s", err)
+		writeJSONResponse(resp, http.StatusBadRequest, fmt.Sprintf(`{"success": false, "reason": "%s"}`, err))
+		return
+	}
+	if len(execRequest.ExecutionId) == 0 || len(execRequest.Authorization) == 0 {
+		writeJSONResponse(resp, http.StatusBadRequest, `{"success": false, "reason": "execution_id and authorization are required"}`)
+		return
+	}
+
+	err = enqueueExecutionJob(executionJob{Request: execRequest})
+	if err != nil {
+		log.Printf("[WARNING][%s] Execution queue full. Rejecting /execute request: %s", execRequest.ExecutionId, err)
+		writeJSONResponse(resp, http.StatusServiceUnavailable, `{"success": false, "reason": "execution queue is full"}`)
+		return
+	}
+
+	writeJSONResponse(resp, http.StatusAccepted, `{"success": true, "accepted": true}`)
 }
 
 func handleDownloadImage(resp http.ResponseWriter, request *http.Request) {
@@ -5312,6 +5393,7 @@ func handleDownloadImage(resp http.ResponseWriter, request *http.Request) {
 func runWebserver(listener net.Listener) {
 	transactionJobOnce.Do(initTransactionWorkers)
 	appRequestOnce.Do(initAppRequestSemaphore)
+	executionJobOnce.Do(initExecutionWorkers)
 
 	r := mux.NewRouter()
 	r.HandleFunc("/api/v1/streams", handleWorkflowQueue).Methods("POST", "OPTIONS")
@@ -5482,8 +5564,9 @@ func scaleApps(ctx context.Context, client *dockerclient.Client, replicas uint64
 }
 
 func getNetworkId(ctx context.Context, dockercli *dockerclient.Client) (string, error) {
+	networkName := getEffectiveSwarmNetworkName()
 	networkFilter := filters.NewArgs()
-	networkFilter.Add("name", swarmNetworkName)
+	networkFilter.Add("name", networkName)
 
 	listOptions := network.ListOptions{
 		Filters: networkFilter,
