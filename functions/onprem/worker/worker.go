@@ -5121,18 +5121,6 @@ func processRunExecution(execRequest shuffle.OrborusExecutionRequest) {
 
 	ctx := context.Background()
 
-	if len(execRequest.HTTPProxy) > 0 {
-		log.Printf("[DEBUG] Sending proxy info to child process")
-		os.Setenv("SHUFFLE_PASS_APP_PROXY", execRequest.ShufflePassProxyToApp)
-	}
-	if len(execRequest.HTTPProxy) > 0 {
-		log.Printf("[DEBUG] Running with default HTTP proxy %s", execRequest.HTTPProxy)
-		os.Setenv("HTTP_PROXY", execRequest.HTTPProxy)
-	}
-	if len(execRequest.HTTPSProxy) > 0 {
-		log.Printf("[DEBUG] Running with default HTTPS proxy %s", execRequest.HTTPSProxy)
-		os.Setenv("HTTPS_PROXY", execRequest.HTTPSProxy)
-	}
 	if len(execRequest.EnvironmentName) > 0 {
 		os.Setenv("ENVIRONMENT_NAME", execRequest.EnvironmentName)
 		environment = execRequest.EnvironmentName
