@@ -347,6 +347,33 @@ func deleteJob(client *kubernetes.Clientset, jobName, namespace string) error {
 	})
 }
 
+func normalizeImageRegistry(registry string) string {
+	return strings.TrimSuffix(strings.TrimSpace(registry), "/")
+}
+
+func kubernetesAppBaseImageName() string {
+	baseImageName := strings.Trim(strings.TrimSpace(os.Getenv("SHUFFLE_BASE_IMAGE_NAME")), "/")
+	if len(baseImageName) > 0 {
+		return baseImageName
+	}
+
+	return "frikky/shuffle"
+}
+
+func appImageDestination(registry, baseImageName, appTag string) (string, error) {
+	tagSplit := strings.SplitN(appTag, ":", 2)
+	if len(tagSplit) != 2 {
+		return "", fmt.Errorf("invalid app image tag %q", appTag)
+	}
+
+	imageName := fmt.Sprintf("%s:%s", strings.TrimSuffix(baseImageName, "/"), tagSplit[1])
+	if len(normalizeImageRegistry(registry)) > 0 {
+		imageName = fmt.Sprintf("%s/%s", normalizeImageRegistry(registry), imageName)
+	}
+
+	return imageName, nil
+}
+
 func buildImage(tags []string, dockerfileLocation string) error {
 
 	isKubernetes := false
@@ -369,6 +396,13 @@ func buildImage(tags []string, dockerfileLocation string) error {
 
 		contextDir := filepath.Join("/app/", filepath.Dir(dockerfileLocation))
 		log.Print("contextDir: ", contextDir)
+		destinationImage, err := appImageDestination(registryName, kubernetesAppBaseImageName(), tags[1])
+		if err != nil {
+			log.Printf("[ERROR] Failed generating Kubernetes app image destination: %s", err)
+			return err
+		}
+
+		log.Printf("[INFO] Kubernetes app image destination: %s", destinationImage)
 
 		client, err := getK8sClient()
 		if err != nil {
@@ -411,7 +445,7 @@ func buildImage(tags []string, dockerfileLocation string) error {
 									"--dockerfile=Dockerfile",
 									"--context=dir://" + contextDir,
 									"--skip-tls-verify",
-									"--destination=" + registryName + "/" + tags[1],
+									"--destination=" + destinationImage,
 								},
 								VolumeMounts: []corev1.VolumeMount{
 									{
