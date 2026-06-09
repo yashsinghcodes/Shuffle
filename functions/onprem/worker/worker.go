@@ -4414,7 +4414,7 @@ func sendAppRequest(ctx context.Context, incomingUrl, appName string, port int, 
 	callbackUrl := os.Getenv("SHUFFLE_WORKER_SERVER_URL")
 	if len(callbackUrl) > 0 {
 		parsedRequest.BaseUrl = callbackUrl
-		if parsedRequest.Action.AppName == "shuffle-subflow" || parsedRequest.Action.AppName == "shuffle-subflow-v2" || parsedRequest.Action.AppName == "User Input" {
+		if (parsedRequest.Action.AppName == "shuffle-subflow" || parsedRequest.Action.AppName == "shuffle-subflow-v2" || parsedRequest.Action.AppName == "User Input") && (len(getAppProxyValue("NO_PROXY", "SHUFFLE_APP_NO_PROXY")) == 0) {
 			parsedRequest.BaseUrl = fmt.Sprintf("http://%s:%d", hostname, baseport)
 			//parsedRequest.Url = parsedRequest.BaseUrl
 		}
