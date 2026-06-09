@@ -86,9 +86,9 @@ shuffle:
   ##
   appRegistry: "docker.io"
 
-  ## @param shuffle.appBaseImageName The base image used for shuffle apps. The final image for an app is <appRegistr>/<appBaseImageName>/<appName>:<appVersion>
+  ## @param shuffle.appBaseImageName The base image used for shuffle apps. The final image for an app is <appRegistry>/<appBaseImageName>:<appName>_<appVersion>
   ##
-  appBaseImageName: "frikky"
+  appBaseImageName: "frikky/shuffle"
 
   ## @param shuffle.timezone The timezone used by Shuffle
   ##
@@ -1781,7 +1781,7 @@ worker:
 app:
   ## @param app.image.registry app image registry (defaults to shuffle.appRegistry)
   ## @param app.image.repository app image repository (defaults to shuffle.appBaseImageName)
-  ## @param app.image.tag app image tag (defaults to the apps version)
+  ## @param app.image.tag app image tag (defaults to the app name and version)
   ## @param app.image.pullPolicy default image pull policy for app deployments. Only effective for helm-deployed apps (see apps.enabled).
   ## @param app.image.pullSecrets default image pull secrets for app deployments. Only effective for helm-deployed apps (see apps.enabled).
   ##

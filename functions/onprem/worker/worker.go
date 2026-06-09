@@ -115,6 +115,38 @@ var subflowPollBackoff sync.Map
 
 var window = shuffle.NewTimeWindow(10 * time.Second)
 
+func normalizeRegistryName(registry string) string {
+	return strings.TrimSuffix(strings.TrimSpace(registry), "/")
+}
+
+func imageHasRegistryPrefix(image string) bool {
+	firstPart := strings.SplitN(image, "/", 2)[0]
+
+	return strings.Contains(firstPart, ".") || strings.Contains(firstPart, ":") || firstPart == "localhost"
+}
+
+func imageHasLocalRegistryPrefix(image, localRegistry string) bool {
+	localRegistry = normalizeRegistryName(localRegistry)
+	if len(localRegistry) == 0 {
+		return false
+	}
+
+	return image == localRegistry || strings.HasPrefix(image, fmt.Sprintf("%s/", localRegistry))
+}
+
+func buildAppImageName(registry, baseImageName, appName, appVersion string) string {
+	imageName := fmt.Sprintf("%s:%s_%s", baseImageName, appName, appVersion)
+	if len(normalizeRegistryName(registry)) > 0 {
+		imageName = fmt.Sprintf("%s/%s", normalizeRegistryName(registry), imageName)
+	}
+
+	if strings.Contains(imageName, " ") {
+		imageName = strings.ReplaceAll(imageName, " ", "-")
+	}
+
+	return imageName
+}
+
 func restoreActionConfig(ctx context.Context, executionID string, action *shuffle.Action, workflowExecution *shuffle.WorkflowExecution) {
 	if len(executionID) == 0 || action == nil {
 		return
@@ -586,7 +618,7 @@ func deployk8sApp(image string, identifier string, env []string) error {
 
 	// Checking if app is generated or not
 	if !(baseDeployMode && autoDeployOverride) {
-		localRegistry = os.Getenv("REGISTRY_URL")
+		localRegistry = normalizeRegistryName(os.Getenv("REGISTRY_URL"))
 	} else {
 		log.Printf("[DEBUG] Detected baseDeploy image (%s) and ghcr override. Resorting to using ghcr instead of registry", image)
 	}
@@ -612,14 +644,14 @@ func deployk8sApp(image string, identifier string, env []string) error {
 	*/
 
 	if (len(localRegistry) == 0 && len(os.Getenv("SHUFFLE_BASE_IMAGE_REGISTRY")) > 0) && !(baseDeployMode && autoDeployOverride) {
-		localRegistry = os.Getenv("SHUFFLE_BASE_IMAGE_REGISTRY")
+		localRegistry = normalizeRegistryName(os.Getenv("SHUFFLE_BASE_IMAGE_REGISTRY"))
 	}
 
-	if (len(localRegistry) > 0 && strings.Count(image, "/") <= 2) && !(baseDeployMode && autoDeployOverride) {
+	if (len(localRegistry) > 0 && !imageHasLocalRegistryPrefix(image, localRegistry) && !imageHasRegistryPrefix(image)) && !(baseDeployMode && autoDeployOverride) {
 		log.Printf("[DEBUG] Using REGISTRY_URL %s", localRegistry)
 		image = fmt.Sprintf("%s/%s", localRegistry, image)
 	} else {
-		if strings.Count(image, "/") <= 2 && !strings.HasPrefix(image, "frikky/shuffle:") {
+		if !imageHasLocalRegistryPrefix(image, localRegistry) && !imageHasRegistryPrefix(image) && strings.Count(image, "/") <= 2 && !strings.HasPrefix(image, "frikky/shuffle:") {
 			image = fmt.Sprintf("frikky/shuffle:%s", image)
 		}
 	}
@@ -1679,20 +1711,17 @@ func handleExecutionResult(workflowExecution shuffle.WorkflowExecution) {
 			}
 		}
 
-		imageName := fmt.Sprintf("%s:%s_%s", baseimagename, parsedAppname, action.AppVersion)
-		if strings.Contains(imageName, " ") {
-			imageName = strings.ReplaceAll(imageName, " ", "-")
-		}
+		imageName := buildAppImageName("", baseimagename, parsedAppname, action.AppVersion)
 
 		// Kubernetes specific.
 		// Should it be though?
 		if isKubernetes == "true" {
 			// Map it to:
-			// <registry>/baseimagename/<appname>:<appversion>
-			localRegistry := os.Getenv("REGISTRY_URL")
+			// <registry>/<baseimagename>:<appname>_<appversion>
+			localRegistry := normalizeRegistryName(os.Getenv("REGISTRY_URL"))
 			if len(localRegistry) > 0 && len(baseimagename) > 0 {
 
-				newImageName := fmt.Sprintf("%s/%s/%s:%s", localRegistry, baseimagename, parsedAppname, action.AppVersion)
+				newImageName := buildAppImageName(localRegistry, baseimagename, parsedAppname, action.AppVersion)
 
 				log.Printf("[INFO] Remapping image name %s to %s due to registry+image name existing on k8s", imageName, newImageName)
 
@@ -1859,8 +1888,8 @@ func handleExecutionResult(workflowExecution shuffle.WorkflowExecution) {
 		// 3. Add remote repo location
 		images := []string{
 			imageName,
-			fmt.Sprintf("%s/%s:%s_%s", registryName, baseimagename, parsedAppname, action.AppVersion),
-			fmt.Sprintf("%s:%s_%s", baseimagename, parsedAppname, action.AppVersion),
+			buildAppImageName(registryName, baseimagename, parsedAppname, action.AppVersion),
+			buildAppImageName("", baseimagename, parsedAppname, action.AppVersion),
 		}
 
 		// This is the weirdest shit ever looking back at
